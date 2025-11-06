@@ -418,7 +418,8 @@ async fn api_upload_unified(
             return Err(create_error(Status::PayloadTooLarge, "Form data is too large."));
         }
 
-        let form: Result<Form<UrlencodedUpload>, _> = Form::parse_form_str(form_str.into_inner().as_str());
+        // CORRECTED LINE: Use Form::parse instead of Form::parse_form_str
+        let form: Result<Form<UrlencodedUpload>, _> = Form::parse(form_str.into_inner().as_str());
         
         return match form {
             Ok(form_content) => process_text_upload(form_content.into_inner().image, &collections.images, config).await,
