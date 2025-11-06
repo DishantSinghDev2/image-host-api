@@ -18,20 +18,19 @@ use rocket::data::{Limits, ToByteUnit};
 use rocket::form::Form;
 use rocket::http::{ContentType, Header, Status};
 use rocket::request::{self, FromRequest, Outcome, Request};
-use rocket::response::{content::Html, status, status::Custom, Redirect};
+use rocket::response::{content::RawHtml, status, status::Custom, Redirect};
 use rocket::serde::{json::Json, Deserialize, Serialize};
-use rocket::{catch, routes, get, post, launch, build, Data, State};
+use rocket::{build, catch, catchers, get, launch, post, routes, Data, State};
 use rocket_multipart_form_data::{
     mime, MultipartFormData, MultipartFormDataField, MultipartFormDataOptions,
 };
 use tokio::{join, task};
 use util::ImageId;
 
-
 lazy_static! {
     static ref HOST: String = std::env::var("HOST").unwrap_or("i.dishis.tech".to_string());
     // The secret key for authorizing uploads. Must be set in the environment.
-    static ref API_SECRET_key: String = std::env::var("API_SECRET_KEY")
+    static ref API_SECRET_KEY: String = std::env::var("API_SECRET_KEY")
         .expect("API_SECRET_KEY must be set in the environment");
 }
 
@@ -427,7 +426,7 @@ async fn api_upload_fallback(
     if raw_body.is_empty() {
         return Err(create_error(Status::BadRequest, "No image data received."));
     }
-    
+
     let ct = infer::get(&raw_body)
         .map(|kind| kind.mime_type().to_string())
         .unwrap_or_else(|| "application/octet-stream".to_string());
@@ -481,7 +480,7 @@ async fn get_delete_confirmation_page(
     id: String,
     token: String,
     collections: &State<db::Collections>,
-) -> Result<Html<String>, status::NotFound<String>> {
+) -> Result<RawHtml<String>, status::NotFound<String>> {
     // Verify the image exists with the correct token before showing the page.
     db::get_image_with_token(&collections.images, &id, &token)
         .await
@@ -528,7 +527,7 @@ async fn get_delete_confirmation_page(
         token = token
     );
 
-    Ok(Html(html_content))
+    Ok(RawHtml(html_content))
 }
 
 #[post("/delete/<id>/<token>")]
@@ -536,12 +535,12 @@ async fn post_delete_image_route(
     id: String,
     token: String,
     collections: &State<db::Collections>,
-) -> Result<Html<&'static str>, status::NotFound<String>> {
+) -> Result<RawHtml<&'static str>, status::NotFound<String>> {
     match db::delete_image(&collections.images, &id, &token).await {
         Ok(result) => {
             if result.deleted_count == 1 {
                 info!("Successfully deleted image {}", id);
-                Ok(Html(
+                Ok(RawHtml(
                     r#"
                     <!DOCTYPE html>
                     <html lang="en">
@@ -637,5 +636,5 @@ async fn rocket() -> _ {
                 post_delete_image_route
             ],
         )
-        .register("/", catch![unauthorized, forbidden])
+        .register("/", catchers![unauthorized, forbidden])
 }

@@ -1,19 +1,18 @@
 //! This is responsible for optimizing images in the background, like how right
 //! after we upload an image we do some heavier work to compress the image
 
-use std::io::Cursor;
-
-use mongodb::bson::{doc, spec::BinarySubtype}; // Add this import
 use crate::encoding::{from_image, FromImageOptions};
-use crate::{db, util};
+use crate::util;
+use crate::util::ImageId;
 use bson::Document;
 use futures::join;
 use futures::stream::TryStreamExt;
 use image::io::Reader;
-use mongodb::bson::doc;
+use log::info;
+use mongodb::bson::{doc, spec::BinarySubtype};
 use mongodb::Collection;
+use std::io::Cursor;
 use tokio::task;
-use util::ImageId;
 
 /// Optimize an image from the database and bump its compression level.
 pub async fn optimize_image_and_update(
@@ -78,21 +77,24 @@ pub async fn optimize_image_and_update(
     );
 
     // CORRECTED: Use a direct `update_one` call instead of `db::insert_image`
-    images_collection.update_one(
-        doc! {"_id": image_id.to_string()},
-        doc! {
-            "$set": {
-                "data": bson::Binary { subtype: BinarySubtype::Generic, bytes: encoded_image.data.to_vec() },
-                "content_type": encoded_image.content_type.to_string(),
-                "width": encoded_image.size.0,
-                "height": encoded_image.size.1,
-                "thumbnail_data": bson::Binary { subtype: BinarySubtype::Generic, bytes: encoded_thumbnail.data.to_vec() },
-                "thumbnail_content_type": encoded_thumbnail.content_type.to_string(),
-                "optim_level": (optimization_level + 1) as i32,
-            }
-        },
-        None
-    ).await.map_err(|e| format!("Updating database failed: {}", e))?;
+    images_collection
+        .update_one(
+            doc! {"_id": image_id.to_string()},
+            doc! {
+                "$set": {
+                    "data": bson::Binary { subtype: BinarySubtype::Generic, bytes: encoded_image.data.to_vec() },
+                    "content_type": encoded_image.content_type.to_string(),
+                    "width": encoded_image.size.0,
+                    "height": encoded_image.size.1,
+                    "thumbnail_data": bson::Binary { subtype: BinarySubtype::Generic, bytes: encoded_thumbnail.data.to_vec() },
+                    "thumbnail_content_type": encoded_thumbnail.content_type.to_string(),
+                    "optim_level": (optimization_level + 1) as i32,
+                }
+            },
+            None,
+        )
+        .await
+        .map_err(|e| format!("Updating database failed: {}", e))?;
 
     Ok(())
 }
