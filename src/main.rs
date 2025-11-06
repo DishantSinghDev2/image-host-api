@@ -418,11 +418,12 @@ async fn api_upload_unified(
             return Err(create_error(Status::PayloadTooLarge, "Form data is too large."));
         }
 
-        // CORRECTED LINE: Use Form::parse instead of Form::parse_form_str
-        let form: Result<Form<UrlencodedUpload>, _> = Form::parse(form_str.into_inner().as_str());
+        // CORRECTED: Parse directly into your struct `UrlencodedUpload`, not `Form<UrlencodedUpload>`
+        let form_result: Result<UrlencodedUpload, _> = Form::parse(form_str.into_inner().as_str());
         
-        return match form {
-            Ok(form_content) => process_text_upload(form_content.into_inner().image, &collections.images, config).await,
+        return match form_result {
+            // CORRECTED: `form_content` is now `UrlencodedUpload`, so no .into_inner() is needed.
+            Ok(form_content) => process_text_upload(form_content.image, &collections.images, config).await,
             Err(_) => Err(create_error(Status::BadRequest, "Failed to parse URL-encoded form."))
         }
     }
