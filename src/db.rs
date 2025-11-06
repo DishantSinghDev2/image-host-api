@@ -169,6 +169,19 @@ pub async fn get_image(
     images_collection.find_one(filter, None).await
 }
 
+/// Get an image document only if the id and delete_token match.
+pub async fn get_image_with_token(
+    images_collection: &Collection<Document>,
+    id: &str,
+    token: &str,
+) -> Result<Option<Document>, mongodb::error::Error> {
+    let filter = doc! {
+        "_id": id,
+        "delete_token": token,
+    };
+    images_collection.find_one(filter, None).await
+}
+
 /// Delete an image if the id and delete_token match
 pub async fn delete_image(
     images_collection: &Collection<Document>,

@@ -16,20 +16,55 @@ use log::{error, info};
 use rocket::data::ToByteUnit;
 use rocket::form::Form;
 use rocket::http::{ContentType, Header, Status};
-use rocket::response::{status, status::Custom, Redirect};
+use rocket::request::{self, FromRequest, Outcome, Request};
+use rocket::response::{status, status::Custom, Html, Redirect};
 use rocket::serde::{json::Json, Deserialize, Serialize};
-use rocket::{Data, State};
+use rocket::{catcher, Data, State};
 use rocket_multipart_form_data::{
     mime, MultipartFormData, MultipartFormDataField, MultipartFormDataOptions,
 };
-use std::io::Cursor;
 use image::GenericImageView;
 use tokio::{join, task};
 use util::ImageId;
 
 lazy_static! {
     static ref HOST: String = std::env::var("HOST").unwrap_or("i.dishis.tech".to_string());
+    // The secret key for authorizing uploads. Must be set in the environment.
+    static ref API_SECRET_KEY: String = std::env::var("API_SECRET_KEY")
+        .expect("API_SECRET_KEY must be set in the environment");
 }
+
+// --- API Key Guard ---
+
+/// A request guard that checks for a valid `X-API-KEY` header.
+struct ApiKeyGuard;
+
+#[derive(Debug)]
+enum ApiKeyError {
+    Missing,
+    Invalid,
+}
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for ApiKeyGuard {
+    type Error = ApiKeyError;
+
+    async fn from_request(req: &'r Request<'_>) -> request::Outcome<Self, Self::Error> {
+        match req.headers().get_one("X-API-KEY") {
+            None => Outcome::Failure((Status::Unauthorized, ApiKeyError::Missing)),
+            Some(key) => {
+                if key == *API_SECRET_KEY {
+                    Outcome::Success(ApiKeyGuard)
+                } else {
+                    Outcome::Failure((Status::Forbidden, ApiKeyError::Invalid))
+                }
+            }
+        }
+    }
+}
+
+
+// --- API Structures ---
 
 #[derive(FromForm)]
 struct UrlencodedUpload {
@@ -83,6 +118,9 @@ struct ApiErrorResponse {
     status: u16,
 }
 
+
+// --- Helper Functions ---
+
 async fn download_image_from_url(url: &str) -> Result<(Vec<u8>, String), String> {
     info!("Downloading image from URL: {}", url);
     let response = reqwest::get(url)
@@ -123,6 +161,9 @@ fn create_error(status: Status, message: &str) -> Custom<Json<ApiErrorResponse>>
 fn mime_to_extension(mime_type: &str) -> &str {
     mime_type.split('/').last().unwrap_or("jpg")
 }
+
+
+// --- Image Processing Logic ---
 
 async fn process_text_upload(
     mut text_value: String,
@@ -280,20 +321,16 @@ async fn process_and_respond(
     }))
 }
 
+
+// --- Routes ---
+
 #[derive(Responder)]
 #[response(status = 200)]
 struct HtmlResponder(&'static str, Header<'static>);
 
-#[get("/")]
-fn index() -> HtmlResponder {
-    HtmlResponder(
-        include_str!("../site/index.html"),
-        Header::new("Content-Type", "text/html; charset=utf-8"),
-    )
-}
-
 #[post("/api/upload", data = "<data>", format = "json", rank = 1, limits = "32 megabytes")]
 async fn api_upload_json(
+    _api_key: ApiKeyGuard, // This guard protects the route
     data: Json<ApiUploadRequest>,
     collections: &State<db::Collections>,
 ) -> Result<Json<ApiResponse>, Custom<Json<ApiErrorResponse>>> {
@@ -315,6 +352,7 @@ async fn api_upload_json(
 
 #[post("/api/upload", data = "<form>", format = "form", rank = 2, limits = "32 megabytes")]
 async fn api_upload_form(
+    _api_key: ApiKeyGuard, // This guard protects the route
     form: Form<UrlencodedUpload>,
     collections: &State<db::Collections>,
 ) -> Result<Json<ApiResponse>, Custom<Json<ApiErrorResponse>>> {
@@ -323,6 +361,7 @@ async fn api_upload_form(
 
 #[post("/api/upload", data = "<data>", rank = 3, limits = "32 megabytes")]
 async fn api_upload_fallback(
+    _api_key: ApiKeyGuard, // This guard protects the route
     content_type: &ContentType,
     data: Data<'_>,
     collections: &State<db::Collections>,
@@ -459,19 +498,99 @@ fn redirect_image_route(id: String) -> Redirect {
     Redirect::to(uri!(view_image_route(id)))
 }
 
-#[delete("/delete/<id>/<token>")]
-async fn delete_image_route(
+// --- Deletion Routes ---
+
+#[get("/delete/<id>/<token>")]
+async fn get_delete_confirmation_page(
     id: String,
     token: String,
     collections: &State<db::Collections>,
-) -> Result<status::NoContent, status::NotFound<String>> {
+) -> Result<Html<String>, status::NotFound<String>> {
+    // Verify the image exists with the correct token before showing the page.
+    db::get_image_with_token(&collections.images, &id, &token)
+        .await
+        .map_err(|_| status::NotFound("Database error".to_string()))?
+        .ok_or_else(|| status::NotFound("Image not found or token incorrect".to_string()))?;
+
+    // If it exists, render the confirmation page.
+    let html_content = format!(
+        r#"
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Confirm Deletion</title>
+            <style>
+                body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; text-align: center; margin-top: 50px; background-color: #f4f4f4; color: #333; }}
+                .container {{ background-color: white; padding: 30px; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); display: inline-block; }}
+                h1 {{ color: #d9534f; }}
+                img {{ max-width: 250px; max-height: 250px; border: 1px solid #ddd; margin: 20px 0; border-radius: 4px; }}
+                .buttons {{ display: flex; justify-content: center; gap: 15px; }}
+                button, .cancel-btn {{ padding: 12px 24px; font-size: 16px; cursor: pointer; border-radius: 5px; text-decoration: none; display: inline-block; font-weight: bold; }}
+                .delete-btn {{ background-color: #d9534f; color: white; border: none; }}
+                .cancel-btn {{ background-color: #6c757d; color: white; border: none; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>Are you sure?</h1>
+                <p>You are about to permanently delete this image:</p>
+                <img src="/i/{id}/thumb" alt="Image thumbnail">
+                <p>This action cannot be undone.</p>
+                <div class="buttons">
+                    <form action="/delete/{id}/{token}" method="post" style="margin:0;">
+                        <button type="submit" class="delete-btn">Yes, Delete Image</button>
+                    </form>
+                    <a href="/i/{id}" class="cancel-btn">Cancel</a>
+                </div>
+            </div>
+        </body>
+        </html>
+        "#,
+        id = id,
+        token = token
+    );
+
+    Ok(Html(html_content))
+}
+
+#[post("/delete/<id>/<token>")]
+async fn post_delete_image_route(
+    id: String,
+    token: String,
+    collections: &State<db::Collections>,
+) -> Result<Html<&'static str>, status::NotFound<String>> {
     match db::delete_image(&collections.images, &id, &token).await {
         Ok(result) => {
             if result.deleted_count == 1 {
                 info!("Successfully deleted image {}", id);
-                Ok(status::NoContent)
+                Ok(Html(
+                    r#"
+                    <!DOCTYPE html>
+                    <html lang="en">
+                    <head>
+                        <meta charset="UTF-8">
+                        <title>Image Deleted</title>
+                        <style>
+                            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; text-align: center; margin-top: 50px; background-color: #f4f4f4; color: #333; }}
+                            .container {{ background-color: white; padding: 30px; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); display: inline-block; }}
+                            a {{ color: #0275d8; text-decoration: none; font-weight: bold; }}
+                        </style>
+                    </head>
+                    <body>
+                        <div class="container">
+                            <h1>Image Deleted Successfully</h1>
+                            <a href="/">Upload another image</a>
+                        </div>
+                    </body>
+                    </html>
+                "#,
+                ))
             } else {
-                Err(status::NotFound("Image not found or token incorrect".to_string()))
+                Err(status::NotFound(
+                    "Image not found or token incorrect".to_string(),
+                ))
             }
         }
         Err(e) => {
@@ -480,6 +599,29 @@ async fn delete_image_route(
         }
     }
 }
+
+// --- Error Catchers for Auth ---
+
+#[catcher(401)]
+fn unauthorized() -> Json<ApiErrorResponse> {
+    Json(ApiErrorResponse {
+        error: "Unauthorized. The X-API-KEY header is missing.".to_string(),
+        success: false,
+        status: 401,
+    })
+}
+
+#[catcher(403)]
+fn forbidden() -> Json<ApiErrorResponse> {
+    Json(ApiErrorResponse {
+        error: "Forbidden. The provided API key is invalid.".to_string(),
+        success: false,
+        status: 403,
+    })
+}
+
+
+// --- Rocket Launch ---
 
 #[launch]
 async fn rocket() -> _ {
@@ -497,17 +639,21 @@ async fn rocket() -> _ {
             .expect("Failed optimizing images");
     });
 
-    rocket::build().manage(collections).mount(
-        "/",
-        routes![
-            index,
-            api_upload_json,
-            api_upload_form,
-            api_upload_fallback,
-            view_image_route,
-            redirect_image_route,
-            view_thumbnail_route,
-            delete_image_route
-        ],
-    )
+    rocket::build()
+        .manage(collections)
+        .mount(
+            "/",
+            routes![
+                index,
+                api_upload_json,
+                api_upload_form,
+                api_upload_fallback,
+                view_image_route,
+                redirect_image_route,
+                view_thumbnail_route,
+                get_delete_confirmation_page, // New route for confirmation page
+                post_delete_image_route      // New route for actual deletion
+            ],
+        )
+        .register("/", catchers![unauthorized, forbidden])
 }
