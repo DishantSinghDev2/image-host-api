@@ -367,14 +367,16 @@ async fn api_upload_form(
     process_text_upload(form.into_inner().image, &collections.images).await
 }
 
+// In src/main.rs
+
 #[post("/api/upload", data = "<data>", rank = 3)]
 async fn api_upload_fallback(
-    _api_key: ApiKeyGuard, // This guard protects the route
+    _api_key: ApiKeyGuard,
     content_type: &ContentType,
     data: Data<'_>,
     collections: &State<db::Collections>,
+    config: &State<Config>,
 ) -> Result<Json<ApiResponse>, Custom<Json<ApiErrorResponse>>> {
-    // --- CASE 1: Proper multipart/form-data ---
     if content_type.is_form_data() {
         let options = MultipartFormDataOptions::with_multipart_form_data_fields(vec![
             MultipartFormDataField::file("image")
@@ -383,9 +385,15 @@ async fn api_upload_fallback(
             MultipartFormDataField::text("image"),
         ]);
 
-        let form_data = MultipartFormData::parse(content_type, data, options)
-            .await
-            .map_err(|e| create_error(Status::BadRequest, &format!("Form parse error: {}", e)))?;
+        // IMPROVED: Add specific error handling for parsing failure.
+        let form_data = match MultipartFormData::parse(content_type, data, options).await {
+            Ok(form_data) => form_data,
+            Err(e) => {
+                let error_message = "Failed to parse multipart/form-data. This often happens if the 'Content-Type' header is missing or malformed. Ensure your client is generating it automatically.";
+                error!("Form parse error: {}. Detailed: {}", error_message, e);
+                return Err(create_error(Status::BadRequest, error_message));
+            }
+        };
 
         if let Some(files) = form_data.files.get("image") {
             if let Some(file) = files.get(0) {
@@ -401,12 +409,12 @@ async fn api_upload_fallback(
                             .map(|k| k.mime_type().to_string())
                             .unwrap_or_else(|| "application/octet-stream".to_string())
                     });
-                return process_and_respond(image_bytes, &ct, &collections.images).await;
+                return process_and_respond(image_bytes, &ct, &collections.images, config).await;
             }
         }
         if let Some(texts) = form_data.texts.get("image") {
             if let Some(text_field) = texts.get(0) {
-                return process_text_upload(text_field.text.clone(), &collections.images).await;
+                return process_text_upload(text_field.text.clone(), &collections.images, config).await;
             }
         }
         return Err(create_error(
@@ -415,7 +423,7 @@ async fn api_upload_fallback(
         ));
     }
 
-    // --- CASE 2: Use the raw body, respecting the 32MB limit set globally.
+    // Fallback for raw binary data
     let raw_body = data
         .open(32.megabytes())
         .into_bytes()
@@ -431,7 +439,7 @@ async fn api_upload_fallback(
         .map(|kind| kind.mime_type().to_string())
         .unwrap_or_else(|| "application/octet-stream".to_string());
 
-    process_and_respond(raw_body, &ct, &collections.images).await
+    process_and_respond(raw_body, &ct, &collections.images, config).await
 }
 
 #[derive(Responder)]
