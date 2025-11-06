@@ -378,6 +378,26 @@ async fn api_upload_fallback(
     collections: &State<db::Collections>,
     config: &State<Config>,
 ) -> Result<Json<ApiResponse>, Custom<Json<ApiErrorResponse>>> {
+    // --- Start of Diagnostic Logging ---
+    println!("--- DIAGNOSTIC: /api/upload fallback triggered ---");
+    println!("--- Received Content-Type header: {:?}", content_type.to_string());
+    
+    // Read the entire body into a buffer to inspect it.
+    let bytes = data.open(32.megabytes()).into_bytes().await.map_err(|e| {
+        create_error(Status::InternalServerError, &format!("Failed to read request body stream: {}", e))
+    })?.into_inner();
+
+    // Try to print the body as a string for debugging.
+    // This might fail if the data isn't valid UTF-8, but that's okay.
+    match std::str::from_utf8(&bytes) {
+        Ok(body_str) => println!("--- Received Body (as string): ---\n{}\n---------------------------------", body_str),
+        Err(_) => println!("--- Received Body (is binary, not valid UTF-8) ---"),
+    }
+    // --- End of Diagnostic Logging ---
+
+    // Re-create the `Data` stream from our buffered bytes so the rest of the function can use it.
+    let data_for_parser = Data::from(bytes);
+
     if content_type.is_form_data() {
         let options = MultipartFormDataOptions::with_multipart_form_data_fields(vec![
             MultipartFormDataField::file("image")
@@ -386,7 +406,7 @@ async fn api_upload_fallback(
             MultipartFormDataField::text("image"),
         ]);
 
-        let form_data = match MultipartFormData::parse(content_type, data, options).await {
+        let form_data = match MultipartFormData::parse(content_type, data_for_parser, options).await {
             Ok(form_data) => form_data,
             Err(e) => {
                 let error_message = "Failed to parse multipart/form-data. This often happens if the 'Content-Type' header is missing or malformed. Ensure your client is generating it automatically.";
@@ -423,13 +443,9 @@ async fn api_upload_fallback(
         ));
     }
 
-    let raw_body = data
-        .open(32.megabytes())
-        .into_bytes()
-        .await
-        .map_err(|_| create_error(Status::BadRequest, "Failed to read request body"))?
-        .into_inner();
-
+    // This part of the code is for raw binary uploads, not form data.
+    // We already consumed the stream, so we need to use the buffered bytes.
+    let raw_body = data_for_parser.into_inner();
     if raw_body.is_empty() {
         return Err(create_error(Status::BadRequest, "No image data received."));
     }
