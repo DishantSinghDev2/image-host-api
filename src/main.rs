@@ -338,108 +338,108 @@ fn index() -> HtmlResponder {
     )
 }
 
-#[post("/api/upload", data = "<data>", format = "json", rank = 1)]
-async fn api_upload_json(
-    _api_key: ApiKeyGuard,
-    data: Json<ApiUploadRequest>,
-    collections: &State<db::Collections>,
-    config: &State<Config>,
-) -> Result<Json<ApiResponse>, Custom<Json<ApiErrorResponse>>> {
-    let req = data.into_inner();
-    if let Some(b64) = req.base64 {
-        return process_text_upload(b64, &collections.images, config).await;
-    }
-    if let Some(url) = req.url {
-        let (image_bytes, ct) = download_image_from_url(&url)
-            .await
-            .map_err(|e| create_error(Status::BadRequest, &e))?;
-        return process_and_respond(image_bytes, &ct, &collections.images, config).await;
-    }
-    Err(create_error(
-        Status::BadRequest,
-        "Missing 'base64' or 'url' field in JSON.",
-    ))
-}
-
-#[post("/api/upload", data = "<form>", format = "form", rank = 2)]
-async fn api_upload_form(
-    _api_key: ApiKeyGuard,
-    form: Form<UrlencodedUpload>,
-    collections: &State<db::Collections>,
-    config: &State<Config>,
-) -> Result<Json<ApiResponse>, Custom<Json<ApiErrorResponse>>> {
-    process_text_upload(form.into_inner().image, &collections.images, config).await
-}
-
-#[post("/api/upload", data = "<data>", rank = 3)]
-async fn api_upload_fallback(
+#[post("/api/upload", data = "<data>")]
+async fn api_upload_unified(
     _api_key: ApiKeyGuard,
     content_type: &ContentType,
     data: Data<'_>,
     collections: &State<db::Collections>,
     config: &State<Config>,
 ) -> Result<Json<ApiResponse>, Custom<Json<ApiErrorResponse>>> {
-    if !content_type.is_form_data() {
-        // Fallback for raw binary data.
-        let raw_body = data.open(32.megabytes()).into_bytes().await.map_err(|_| {
-            create_error(Status::BadRequest, "Failed to read request body")
-        })?.into_inner();
-
-        if raw_body.is_empty() {
-            return Err(create_error(Status::BadRequest, "No image data received."));
+    // --- 1. Handle JSON Body ---
+    if content_type.is_json() {
+        let string_data = data.open(32.megabytes()).into_string().await
+            .map_err(|_| create_error(Status::BadRequest, "Failed to read request body as string"))?;
+            
+        if !string_data.is_complete() {
+             return Err(create_error(Status::PayloadTooLarge, "JSON data is too large."));
         }
 
-        let ct = infer::get(&raw_body)
-            .map(|kind| kind.mime_type().to_string())
-            .unwrap_or_else(|| "application/octet-stream".to_string());
+        let req: ApiUploadRequest = rocket::serde::json::from_str(string_data.into_inner().as_str())
+            .map_err(|_| create_error(Status::BadRequest, "Invalid JSON format."))?;
 
-        return process_and_respond(raw_body, &ct, &collections.images, config).await;
+        if let Some(b64) = req.base64 {
+            return process_text_upload(b64, &collections.images, config).await;
+        }
+        if let Some(url) = req.url {
+            let (image_bytes, ct) = download_image_from_url(&url).await
+                .map_err(|e| create_error(Status::BadRequest, &e))?;
+            return process_and_respond(image_bytes, &ct, &collections.images, config).await;
+        }
+        return Err(create_error(Status::BadRequest, "Missing 'base64' or 'url' in JSON."));
     }
 
-    let options = MultipartFormDataOptions::with_multipart_form_data_fields(vec![
-        MultipartFormDataField::file("image")
-            .content_type_by_string(Some(mime::STAR_STAR))
-            .unwrap(),
-        MultipartFormDataField::text("image"),
-    ]);
+    // --- 2. Handle Multipart Form Data ---
+    if content_type.is_form_data() {
+        let options = MultipartFormDataOptions::with_multipart_form_data_fields(vec![
+            MultipartFormDataField::file("image").content_type_by_string(Some(mime::STAR_STAR)).unwrap(),
+            MultipartFormDataField::text("image"),
+        ]);
 
-    let form_data = match MultipartFormData::parse(content_type, data, options).await {
-        Ok(form_data) => form_data,
-        Err(e) => {
-            let error_message = "Failed to parse multipart/form-data. This often happens if the 'Content-Type' header is missing or malformed. Ensure your client is generating it automatically.";
-            error!("Form parse error: {}. Detailed: {}", error_message, e);
-            return Err(create_error(Status::BadRequest, error_message));
+        match MultipartFormData::parse(content_type, data, options).await {
+            Ok(form_data) => {
+                // Prioritize the file field if it exists
+                if let Some(files) = form_data.files.get("image") {
+                    if let Some(file) = files.first() {
+                        let image_bytes = tokio::fs::read(&file.path).await.map_err(|_| {
+                            create_error(Status::InternalServerError, "Could not read uploaded file")
+                        })?;
+                        let ct = file.content_type.as_ref().map(|ct| ct.to_string())
+                            .unwrap_or_else(|| {
+                                infer::get(&image_bytes).map(|k| k.mime_type().to_string())
+                                .unwrap_or_else(|| "application/octet-stream".to_string())
+                            });
+                        return process_and_respond(image_bytes, &ct, &collections.images, config).await;
+                    }
+                }
+                // Fallback to a text field (for Base64/URL)
+                if let Some(texts) = form_data.texts.get("image") {
+                    if let Some(text_field) = texts.first() {
+                        return process_text_upload(text_field.text.clone(), &collections.images, config).await;
+                    }
+                }
+                return Err(create_error(Status::BadRequest, "Missing 'image' field in multipart form."));
+            }
+            Err(_) => {
+                // This is the error you were getting. We can now give a better message or try another method.
+                // For now, we'll return the helpful error.
+                let error_message = "Failed to parse multipart/form-data. This often happens if the 'Content-Type' header is missing a boundary or is malformed.";
+                return Err(create_error(Status::BadRequest, error_message));
+            }
+        };
+    }
+
+    // --- 3. Handle URL-Encoded Form (often used for Base64) ---
+    if content_type.is_form() {
+        let form_str = data.open(32.megabytes()).into_string().await
+            .map_err(|_| create_error(Status::BadRequest, "Failed to read form body"))?;
+
+        if !form_str.is_complete() {
+            return Err(create_error(Status::PayloadTooLarge, "Form data is too large."));
         }
-    };
 
-    if let Some(file_fields) = form_data.files.get("image") {
-        if let Some(file_field) = file_fields.first() {
-            let image_bytes = match tokio::fs::read(&file_field.path).await {
-                Ok(bytes) => bytes,
-                Err(_) => return Err(create_error(Status::InternalServerError, "Could not read uploaded file")),
-            };
-            
-            let content_type = file_field.content_type.as_ref().map_or_else(
-                || infer::get(&image_bytes)
-                    .map(|k| k.mime_type().to_string())
-                    .unwrap_or_else(|| "application/octet-stream".to_string()),
-                |ct| ct.to_string(),
-            );
-
-            return process_and_respond(image_bytes, &content_type, &collections.images, config).await;
+        let form: Result<Form<UrlencodedUpload>, _> = Form::parse_form_str(form_str.into_inner().as_str());
+        
+        return match form {
+            Ok(form_content) => process_text_upload(form_content.into_inner().image, &collections.images, config).await,
+            Err(_) => Err(create_error(Status::BadRequest, "Failed to parse URL-encoded form."))
         }
     }
     
-    if let Some(text_fields) = form_data.texts.get("image") {
-        if let Some(text_field) = text_fields.first() {
-            return process_text_upload(text_field.text.clone(), &collections.images, config).await;
-        }
+    // --- 4. ULTIMATE FALLBACK: Treat the entire body as raw image data ---
+    let raw_body = data.open(32.megabytes()).into_bytes().await.map_err(|_| {
+        create_error(Status::BadRequest, "Failed to read request body")
+    })?.into_inner();
+
+    if raw_body.is_empty() {
+        return Err(create_error(Status::BadRequest, "No image data received."));
     }
 
-    Err(create_error(
-        Status::BadRequest,
-        "Missing 'image' field in multipart form.",
-    ))
+    let ct = infer::get(&raw_body)
+        .map(|kind| kind.mime_type().to_string())
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+
+    process_and_respond(raw_body, &ct, &collections.images, config).await
 }
 
 #[derive(Responder)]
@@ -632,9 +632,7 @@ async fn rocket() -> _ {
             "/",
             routes![
                 index,
-                api_upload_json,
-                api_upload_form,
-                api_upload_fallback,
+                api_upload_unified, // The ONLY upload route needed now!
                 view_image_route,
                 redirect_image_route,
                 view_thumbnail_route,
