@@ -24,6 +24,8 @@ use rocket_multipart_form_data::{
 use std::env;
 use tokio::{join, task};
 use util::ImageId;
+use std::io::Cursor;
+
 
 // --- Config Struct ---
 // A struct to hold our application's configuration.
@@ -388,15 +390,15 @@ async fn api_upload_fallback(
     })?.into_inner();
 
     // Try to print the body as a string for debugging.
-    // This might fail if the data isn't valid UTF-8, but that's okay.
     match std::str::from_utf8(&bytes) {
         Ok(body_str) => println!("--- Received Body (as string): ---\n{}\n---------------------------------", body_str),
         Err(_) => println!("--- Received Body (is binary, not valid UTF-8) ---"),
     }
     // --- End of Diagnostic Logging ---
 
-    // Re-create the `Data` stream from our buffered bytes so the rest of the function can use it.
-    let data_for_parser = Data::from(bytes);
+    // CORRECTED: Re-create the `Data` stream from our buffered bytes using a Cursor.
+    // We clone `bytes` because we might need it later for the raw binary fallback.
+    let data_for_parser = Data::from(Cursor::new(bytes.clone()));
 
     if content_type.is_form_data() {
         let options = MultipartFormDataOptions::with_multipart_form_data_fields(vec![
@@ -443,9 +445,8 @@ async fn api_upload_fallback(
         ));
     }
 
-    // This part of the code is for raw binary uploads, not form data.
-    // We already consumed the stream, so we need to use the buffered bytes.
-    let raw_body = data_for_parser.into_inner();
+    // CORRECTED: For the raw binary fallback, just use the `bytes` vector we already buffered.
+    let raw_body = bytes;
     if raw_body.is_empty() {
         return Err(create_error(Status::BadRequest, "No image data received."));
     }
