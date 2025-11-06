@@ -379,69 +379,67 @@ async fn api_upload_fallback(
     collections: &State<db::Collections>,
     config: &State<Config>,
 ) -> Result<Json<ApiResponse>, Custom<Json<ApiErrorResponse>>> {
-    // This function now correctly handles the one-time-use `Data` stream.
-    if content_type.is_form_data() {
-        let options = MultipartFormDataOptions::with_multipart_form_data_fields(vec![
-            MultipartFormDataField::file("image")
-                .content_type_by_string(Some(mime::STAR_STAR))
-                .unwrap(),
-            MultipartFormDataField::text("image"),
-        ]);
+    if !content_type.is_form_data() {
+        // Fallback for raw binary data.
+        let raw_body = data.open(32.megabytes()).into_bytes().await.map_err(|_| {
+            create_error(Status::BadRequest, "Failed to read request body")
+        })?.into_inner();
 
-        // The parser will consume the `data` stream directly.
-        let form_data = match MultipartFormData::parse(content_type, data, options).await {
-            Ok(form_data) => form_data,
-            Err(e) => {
-                // We keep the improved error message because it's very helpful.
-                let error_message = "Failed to parse multipart/form-data. This often happens if the 'Content-Type' header is missing or malformed. Ensure your client is generating it automatically.";
-                error!("Form parse error: {}. Detailed: {}", error_message, e);
-                return Err(create_error(Status::BadRequest, error_message));
-            }
-        };
+        if raw_body.is_empty() {
+            return Err(create_error(Status::BadRequest, "No image data received."));
+        }
 
-        if let Some(files) = form_data.files.get("image") {
-            if let Some(file) = files.get(0) {
-                let image_bytes = tokio::fs::read(&file.path).await.map_err(|_| {
-                    create_error(Status::InternalServerError, "Could not read uploaded file")
-                })?;
-                let ct = file
-                    .content_type
-                    .as_ref()
-                    .map(|ct| ct.to_string())
-                    .unwrap_or_else(|| {
-                        infer::get(&image_bytes)
-                            .map(|k| k.mime_type().to_string())
-                            .unwrap_or_else(|| "application/octet-stream".to_string())
-                    });
-                return process_and_respond(image_bytes, &ct, &collections.images, config).await;
-            }
-        }
-        if let Some(texts) = form_data.texts.get("image") {
-            if let Some(text_field) = texts.get(0) {
-                return process_text_upload(text_field.text.clone(), &collections.images, config).await;
-            }
-        }
-        return Err(create_error(
-            Status::BadRequest,
-            "Missing 'image' field in multipart form.",
-        ));
+        let ct = infer::get(&raw_body)
+            .map(|kind| kind.mime_type().to_string())
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+
+        return process_and_respond(raw_body, &ct, &collections.images, config).await;
     }
 
-    // Fallback for raw binary data.
-    // This will only run if the content type is NOT form-data.
-    let raw_body = data.open(32.megabytes()).into_bytes().await.map_err(|_| {
-        create_error(Status::BadRequest, "Failed to read request body")
-    })?.into_inner();
+    let options = MultipartFormDataOptions::with_multipart_form_data_fields(vec![
+        MultipartFormDataField::file("image")
+            .content_type_by_string(Some(mime::STAR_STAR))
+            .unwrap(),
+        MultipartFormDataField::text("image"),
+    ]);
 
-    if raw_body.is_empty() {
-        return Err(create_error(Status::BadRequest, "No image data received."));
+    let form_data = match MultipartFormData::parse(content_type, data, options).await {
+        Ok(form_data) => form_data,
+        Err(e) => {
+            let error_message = "Failed to parse multipart/form-data. This often happens if the 'Content-Type' header is missing or malformed. Ensure your client is generating it automatically.";
+            error!("Form parse error: {}. Detailed: {}", error_message, e);
+            return Err(create_error(Status::BadRequest, error_message));
+        }
+    };
+
+    if let Some(file_fields) = form_data.files.get("image") {
+        if let Some(file_field) = file_fields.first() {
+            let image_bytes = match tokio::fs::read(&file_field.path).await {
+                Ok(bytes) => bytes,
+                Err(_) => return Err(create_error(Status::InternalServerError, "Could not read uploaded file")),
+            };
+            
+            let content_type = file_field.content_type.as_ref().map_or_else(
+                || infer::get(&image_bytes)
+                    .map(|k| k.mime_type().to_string())
+                    .unwrap_or_else(|| "application/octet-stream".to_string()),
+                |ct| ct.to_string(),
+            );
+
+            return process_and_respond(image_bytes, &content_type, &collections.images, config).await;
+        }
+    }
+    
+    if let Some(text_fields) = form_data.texts.get("image") {
+        if let Some(text_field) = text_fields.first() {
+            return process_text_upload(text_field.text.clone(), &collections.images, config).await;
+        }
     }
 
-    let ct = infer::get(&raw_body)
-        .map(|kind| kind.mime_type().to_string())
-        .unwrap_or_else(|| "application/octet-stream".to_string());
-
-    process_and_respond(raw_body, &ct, &collections.images, config).await
+    Err(create_error(
+        Status::BadRequest,
+        "Missing 'image' field in multipart form.",
+    ))
 }
 
 #[derive(Responder)]
