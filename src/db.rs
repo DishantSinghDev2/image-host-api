@@ -7,7 +7,7 @@ use log::info;
 use mongodb::{
     bson::{doc, Document},
     options::{ClientOptions, FindOneAndUpdateOptions, ResolverConfig, ReturnDocument},
-    results::UpdateResult,
+    results::{DeleteResult, UpdateResult},
     Client, Collection,
 };
 use std::env;
@@ -24,6 +24,8 @@ pub struct NewImage<'a> {
     /// How optimized the image is.
     /// 0 means the image was *just* uploaded with minimal optimization.
     pub optim_level: u8,
+    
+    pub delete_token: &'a str,
 
     pub data: &'a Vec<u8>,
     pub content_type: &'a str,
@@ -119,13 +121,14 @@ pub async fn insert_image(
                 "$setOnInsert": {
                     "date": bson::DateTime::now(),                    
                     "last_seen": bson::DateTime::now(),
+                    "delete_token": image.delete_token,
                 },
                 "$set": {
                     "data": bson::Binary { subtype: BinarySubtype::Generic, bytes: image.data.to_vec() },
                     "content_type": image.content_type,
 
                     "width": image.size.0,
-                    "height": image.size.0,
+                    "height": image.size.1,
 
                     "thumbnail_data": bson::Binary { subtype: BinarySubtype::Generic, bytes: image.thumbnail_data.to_vec() },
                     "thumbnail_content_type": image.thumbnail_content_type,
@@ -164,4 +167,22 @@ pub async fn get_image(
 ) -> Result<Option<Document>, mongodb::error::Error> {
     let filter = doc! {"_id": id};
     images_collection.find_one(filter, None).await
+}
+
+/// Delete an image if the id and delete_token match
+pub async fn delete_image(
+    images_collection: &Collection<Document>,
+    id: &str,
+    token: &str,
+) -> Result<DeleteResult, mongodb::error::Error> {
+    info!("deleting image {}", id);
+    images_collection
+        .delete_one(
+            doc! {
+                "_id": id,
+                "delete_token": token,
+            },
+            None,
+        )
+        .await
 }

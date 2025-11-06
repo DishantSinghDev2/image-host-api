@@ -53,6 +53,14 @@ pub fn generate_random_id(length: usize) -> ImageId {
     ))
 }
 
+/// Generate a random string meant to be used as a deletion token.
+pub fn generate_delete_token(length: usize) -> String {
+    generate_random_string(
+        length,
+        b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+    )
+}
+
 #[cfg(test)]
 mod test {
     use super::*;

@@ -6,6 +6,7 @@ use image::imageops::FilterType;
 use image::io::Reader as ImageReader;
 use image::DynamicImage;
 use image::GenericImageView;
+use log::info;
 use std::io::Cursor;
 use std::{fmt::Debug, path::PathBuf};
 use tokio::task;
@@ -61,7 +62,8 @@ fn to_webp(im: &DynamicImage) -> Result<CompressedImageResult, String> {
         Ok(i) => i,
         Err(e) => return Err(format!("Error making encoder for webp: {}", e.to_string())),
     };
-    let image_bytes = (*encoder.encode(90.0)).to_vec();
+    // Use lossless encoding to preserve quality.
+    let image_bytes = (*encoder.encode_lossless()).to_vec();
     info!("encoded webp");
 
     Ok(CompressedImageResult {

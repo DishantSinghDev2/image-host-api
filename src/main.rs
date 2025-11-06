@@ -12,18 +12,18 @@ mod util;
 use background_optimization::{optimize_image_and_update, optimize_images_from_database};
 use base64::{engine::general_purpose, Engine as _};
 use dotenv::dotenv;
-use log::info;
+use log::{error, info};
 use rocket::data::ToByteUnit;
 use rocket::form::Form;
 use rocket::http::{ContentType, Header, Status};
-use rocket::response::{status::Custom, Redirect};
-use rocket::serde::json::serde_json;
+use rocket::response::{status, status::Custom, Redirect};
 use rocket::serde::{json::Json, Deserialize, Serialize};
 use rocket::{Data, State};
 use rocket_multipart_form_data::{
     mime, MultipartFormData, MultipartFormDataField, MultipartFormDataOptions,
 };
 use std::io::Cursor;
+use image::GenericImageView;
 use tokio::{join, task};
 use util::ImageId;
 
@@ -179,9 +179,9 @@ async fn process_and_respond(
             &format!("Failed to decode image: {}", e),
         )
     })?;
+    let (width, height) = decoded_image.dimensions();
 
-    let (encoded_image_result, encoded_thumbnail_result, image_id_result) = join!(
-        encoding::from_image(decoded_image.clone(), encoding::FromImageOptions::default()),
+    let (encoded_thumbnail_result, image_id_result) = join!(
         encoding::from_image(
             decoded_image,
             encoding::FromImageOptions {
@@ -192,23 +192,24 @@ async fn process_and_respond(
         db::generate_image_id(images_collection)
     );
 
-    let encoded_image =
-        encoded_image_result.map_err(|e| create_error(Status::InternalServerError, &e))?;
     let encoded_thumbnail =
         encoded_thumbnail_result.map_err(|e| create_error(Status::InternalServerError, &e))?;
     let image_id =
         image_id_result.map_err(|e| create_error(Status::InternalServerError, &e.to_string()))?;
+    
+    let delete_token = util::generate_delete_token(16);
 
     let insert_result = db::insert_image(
         images_collection,
         &db::NewImage {
             id: &image_id,
-            data: &encoded_image.data,
-            content_type: &encoded_image.content_type,
+            data: &image_bytes,
+            content_type: content_type_string,
             thumbnail_data: &encoded_thumbnail.data,
             thumbnail_content_type: &encoded_thumbnail.content_type,
-            size: encoded_image.size,
+            size: (width, height),
             optim_level: 0,
+            delete_token: &delete_token,
         },
     )
     .await;
@@ -233,10 +234,11 @@ async fn process_and_respond(
         .unwrap()
         .timestamp_millis()
         / 1000;
-    let image_ext = mime_to_extension(&encoded_image.content_type);
+    let image_ext = mime_to_extension(content_type_string);
     let thumb_ext = mime_to_extension(&encoded_thumbnail.content_type);
     let image_url = format!("{}/i/{}", base_url, id_str);
     let thumb_url = format!("{}/i/{}/thumb", base_url, id_str);
+    let delete_url = format!("{}/delete/{}/{}", base_url, id_str, delete_token);
 
     Ok(Json(ApiResponse {
         data: ApiImageData {
@@ -245,23 +247,23 @@ async fn process_and_respond(
             url_viewer: image_url.clone(),
             url: image_url.clone(),
             display_url: image_url.clone(),
-            width: encoded_image.size.0.to_string(),
-            height: encoded_image.size.1.to_string(),
-            size: encoded_image.data.len().to_string(),
+            width: width.to_string(),
+            height: height.to_string(),
+            size: image_bytes.len().to_string(),
             time: creation_time.to_string(),
             expiration: "0".to_string(),
-            delete_url: format!("{}/delete/placeholder", image_url),
+            delete_url,
             image: ApiImageVariant {
                 filename: format!("{}.{}", id_str, image_ext),
                 name: id_str.clone(),
-                mime: encoded_image.content_type.clone(),
+                mime: content_type_string.to_string(),
                 extension: image_ext.to_string(),
                 url: image_url.clone(),
             },
             medium: ApiImageVariant {
                 filename: format!("{}.{}", id_str, image_ext),
                 name: id_str.clone(),
-                mime: encoded_image.content_type.clone(),
+                mime: content_type_string.to_string(),
                 extension: image_ext.to_string(),
                 url: image_url.clone(),
             },
@@ -290,7 +292,7 @@ fn index() -> HtmlResponder {
     )
 }
 
-#[post("/api/upload", data = "<data>", format = "json", rank = 1)]
+#[post("/api/upload", data = "<data>", format = "json", rank = 1, limits = "32 megabytes")]
 async fn api_upload_json(
     data: Json<ApiUploadRequest>,
     collections: &State<db::Collections>,
@@ -311,7 +313,7 @@ async fn api_upload_json(
     ))
 }
 
-#[post("/api/upload", data = "<form>", format = "form", rank = 2)]
+#[post("/api/upload", data = "<form>", format = "form", rank = 2, limits = "32 megabytes")]
 async fn api_upload_form(
     form: Form<UrlencodedUpload>,
     collections: &State<db::Collections>,
@@ -319,7 +321,7 @@ async fn api_upload_form(
     process_text_upload(form.into_inner().image, &collections.images).await
 }
 
-#[post("/api/upload", data = "<data>", rank = 3)]
+#[post("/api/upload", data = "<data>", rank = 3, limits = "32 megabytes")]
 async fn api_upload_fallback(
     content_type: &ContentType,
     data: Data<'_>,
@@ -368,7 +370,7 @@ async fn api_upload_fallback(
 
     // --- CASE 2: Custom raw boundary parsing ---
     let raw_body = data
-        .open(20.megabytes())
+        .open(32.megabytes())
         .into_bytes()
         .await
         .map_err(|_| create_error(Status::BadRequest, "Failed to read request body"))?
@@ -457,6 +459,28 @@ fn redirect_image_route(id: String) -> Redirect {
     Redirect::to(uri!(view_image_route(id)))
 }
 
+#[delete("/delete/<id>/<token>")]
+async fn delete_image_route(
+    id: String,
+    token: String,
+    collections: &State<db::Collections>,
+) -> Result<status::NoContent, status::NotFound<String>> {
+    match db::delete_image(&collections.images, &id, &token).await {
+        Ok(result) => {
+            if result.deleted_count == 1 {
+                info!("Successfully deleted image {}", id);
+                Ok(status::NoContent)
+            } else {
+                Err(status::NotFound("Image not found or token incorrect".to_string()))
+            }
+        }
+        Err(e) => {
+            error!("Error deleting image {}: {}", id, e);
+            Err(status::NotFound("Error during deletion".to_string()))
+        }
+    }
+}
+
 #[launch]
 async fn rocket() -> _ {
     dotenv().ok();
@@ -482,7 +506,8 @@ async fn rocket() -> _ {
             api_upload_fallback,
             view_image_route,
             redirect_image_route,
-            view_thumbnail_route
+            view_thumbnail_route,
+            delete_image_route
         ],
     )
 }
