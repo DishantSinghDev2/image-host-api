@@ -415,8 +415,13 @@ async fn api_upload_unified(
         if !form_str.is_complete() {
             return Err(create_error(Status::PayloadTooLarge, "Form data is too large."));
         }
+
+        // FIX: Bind the owned String to a variable to extend its lifetime.
+        let form_body = form_str.into_inner();
         
-        let form_result: Result<UrlencodedUpload, _> = Form::parse(form_str.into_inner().as_str());
+        // Now, `form_result` borrows from `form_body`, which lives until the end of the `if` block.
+        // We can pass a reference `&form_body` directly; Rust coerces `&String` to `&str`.
+        let form_result: Result<UrlencodedUpload, _> = Form::parse(&form_body);
         
         return match form_result {
             Ok(form_content) => process_text_upload(form_content.image, &collections.images, config).await,
