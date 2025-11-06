@@ -1,9 +1,6 @@
 #[macro_use]
 extern crate rocket;
 
-#[macro_use]
-extern crate lazy_static;
-
 mod background_optimization;
 mod db;
 mod encoding;
@@ -24,19 +21,19 @@ use rocket::{build, catch, catchers, get, launch, post, routes, Data, State};
 use rocket_multipart_form_data::{
     mime, MultipartFormData, MultipartFormDataField, MultipartFormDataOptions,
 };
+use std::env;
 use tokio::{join, task};
 use util::ImageId;
 
-lazy_static! {
-    static ref HOST: String = std::env::var("HOST").unwrap_or("i.dishis.tech".to_string());
-    // The secret key for authorizing uploads. Must be set in the environment.
-    static ref API_SECRET_KEY: String = std::env::var("API_SECRET_KEY")
-        .expect("API_SECRET_KEY must be set in the environment");
+// --- Config Struct ---
+// A struct to hold our application's configuration.
+pub struct Config {
+    host: String,
+    api_secret_key: String,
 }
 
 // --- API Key Guard ---
-
-/// A request guard that checks for a valid `X-API-KEY` header.
+// It now gets the API key from the managed state instead of a global static.
 struct ApiKeyGuard;
 
 #[derive(Debug)]
@@ -50,10 +47,15 @@ impl<'r> FromRequest<'r> for ApiKeyGuard {
     type Error = ApiKeyError;
 
     async fn from_request(req: &'r Request<'_>) -> request::Outcome<Self, Self::Error> {
+        let config = match req.guard::<&State<Config>>().await {
+            Outcome::Success(config) => config,
+            _ => return Outcome::Error((Status::InternalServerError, ApiKeyError::Missing)),
+        };
+
         match req.headers().get_one("X-API-KEY") {
             None => Outcome::Error((Status::Unauthorized, ApiKeyError::Missing)),
             Some(key) => {
-                if key == *API_SECRET_KEY {
+                if key == &config.api_secret_key {
                     Outcome::Success(ApiKeyGuard)
                 } else {
                     Outcome::Error((Status::Forbidden, ApiKeyError::Invalid))
@@ -65,7 +67,6 @@ impl<'r> FromRequest<'r> for ApiKeyGuard {
 
 
 // --- API Structures ---
-
 #[derive(FromForm)]
 struct UrlencodedUpload {
     image: String,
@@ -120,7 +121,6 @@ struct ApiErrorResponse {
 
 
 // --- Helper Functions ---
-
 async fn download_image_from_url(url: &str) -> Result<(Vec<u8>, String), String> {
     info!("Downloading image from URL: {}", url);
     let response = reqwest::get(url)
@@ -163,11 +163,11 @@ fn mime_to_extension(mime_type: &str) -> &str {
 }
 
 
-// --- Image Processing Logic ---
-
+// --- Image Processing Logic (CORRECTED) ---
 async fn process_text_upload(
     mut text_value: String,
     images_collection: &mongodb::Collection<mongodb::bson::Document>,
+    config: &State<Config>, // <-- CORRECTED: Added config argument
 ) -> Result<Json<ApiResponse>, Custom<Json<ApiErrorResponse>>> {
     text_value = text_value.trim().to_string();
 
@@ -175,7 +175,7 @@ async fn process_text_upload(
         let (image_bytes, ct) = download_image_from_url(&text_value)
             .await
             .map_err(|e| create_error(Status::BadRequest, &e))?;
-        return process_and_respond(image_bytes, &ct, images_collection).await;
+        return process_and_respond(image_bytes, &ct, images_collection, config).await;
     }
 
     if let Some(idx) = text_value.find(',') {
@@ -193,13 +193,14 @@ async fn process_text_upload(
         )
     })?;
 
-    process_and_respond(image_bytes, kind.mime_type(), images_collection).await
+    process_and_respond(image_bytes, kind.mime_type(), images_collection, config).await
 }
 
 async fn process_and_respond(
     image_bytes: Vec<u8>,
     content_type_string: &str,
     images_collection: &mongodb::Collection<mongodb::bson::Document>,
+    config: &State<Config>, // <-- CORRECTED: Added config argument
 ) -> Result<Json<ApiResponse>, Custom<Json<ApiErrorResponse>>> {
     if image_bytes.is_empty() {
         return Err(create_error(
@@ -269,7 +270,7 @@ async fn process_and_respond(
     });
 
     let id_str = image_id.to_string();
-    let base_url = format!("https://{}", *HOST);
+    let base_url = format!("https://{}", config.host);
     let creation_time = inserted_doc
         .get_datetime("date")
         .unwrap()
@@ -338,19 +339,20 @@ fn index() -> HtmlResponder {
 
 #[post("/api/upload", data = "<data>", format = "json", rank = 1)]
 async fn api_upload_json(
-    _api_key: ApiKeyGuard, // This guard protects the route
+    _api_key: ApiKeyGuard,
     data: Json<ApiUploadRequest>,
     collections: &State<db::Collections>,
+    config: &State<Config>,
 ) -> Result<Json<ApiResponse>, Custom<Json<ApiErrorResponse>>> {
     let req = data.into_inner();
     if let Some(b64) = req.base64 {
-        return process_text_upload(b64, &collections.images).await;
+        return process_text_upload(b64, &collections.images, config).await;
     }
     if let Some(url) = req.url {
         let (image_bytes, ct) = download_image_from_url(&url)
             .await
             .map_err(|e| create_error(Status::BadRequest, &e))?;
-        return process_and_respond(image_bytes, &ct, &collections.images).await;
+        return process_and_respond(image_bytes, &ct, &collections.images, config).await;
     }
     Err(create_error(
         Status::BadRequest,
@@ -360,14 +362,13 @@ async fn api_upload_json(
 
 #[post("/api/upload", data = "<form>", format = "form", rank = 2)]
 async fn api_upload_form(
-    _api_key: ApiKeyGuard, // This guard protects the route
+    _api_key: ApiKeyGuard,
     form: Form<UrlencodedUpload>,
     collections: &State<db::Collections>,
+    config: &State<Config>,
 ) -> Result<Json<ApiResponse>, Custom<Json<ApiErrorResponse>>> {
-    process_text_upload(form.into_inner().image, &collections.images).await
+    process_text_upload(form.into_inner().image, &collections.images, config).await
 }
-
-// In src/main.rs
 
 #[post("/api/upload", data = "<data>", rank = 3)]
 async fn api_upload_fallback(
@@ -385,7 +386,6 @@ async fn api_upload_fallback(
             MultipartFormDataField::text("image"),
         ]);
 
-        // IMPROVED: Add specific error handling for parsing failure.
         let form_data = match MultipartFormData::parse(content_type, data, options).await {
             Ok(form_data) => form_data,
             Err(e) => {
@@ -423,7 +423,6 @@ async fn api_upload_fallback(
         ));
     }
 
-    // Fallback for raw binary data
     let raw_body = data
         .open(32.megabytes())
         .into_bytes()
@@ -481,21 +480,17 @@ fn redirect_image_route(id: String) -> Redirect {
     Redirect::to(uri!(view_image_route(id)))
 }
 
-// --- Deletion Routes ---
-
 #[get("/delete/<id>/<token>")]
 async fn get_delete_confirmation_page(
     id: String,
     token: String,
     collections: &State<db::Collections>,
 ) -> Result<RawHtml<String>, status::NotFound<String>> {
-    // Verify the image exists with the correct token before showing the page.
     db::get_image_with_token(&collections.images, &id, &token)
         .await
         .map_err(|_| status::NotFound("Database error".to_string()))?
         .ok_or_else(|| status::NotFound("Image not found or token incorrect".to_string()))?;
 
-    // If it exists, render the confirmation page.
     let html_content = format!(
         r#"
         <!DOCTYPE html>
@@ -564,7 +559,6 @@ async fn post_delete_image_route(
                     <body>
                         <div class="container">
                             <h1>Image Deleted Successfully</h1>
-                            <a href="/">Upload another image</a>
                         </div>
                     </body>
                     </html>
@@ -582,8 +576,6 @@ async fn post_delete_image_route(
         }
     }
 }
-
-// --- Error Catchers for Auth ---
 
 #[catch(401)]
 fn unauthorized() -> Json<ApiErrorResponse> {
@@ -603,15 +595,19 @@ fn forbidden() -> Json<ApiErrorResponse> {
     })
 }
 
-
-// --- Rocket Launch ---
-
 #[launch]
 async fn rocket() -> _ {
     dotenv().ok();
     env_logger::init();
 
-    // Set a 32 megabyte limit for all incoming data.
+    let api_secret_key = env::var("API_SECRET_KEY")
+        .expect("FATAL: API_SECRET_KEY environment variable not set.");
+
+    let config = Config {
+        host: env::var("HOST").unwrap_or("i.dishis.tech".to_string()),
+        api_secret_key,
+    };
+
     let figment = rocket::Config::figment()
         .merge(("limits", Limits::new().limit("bytes", 32.mebibytes().into())));
 
@@ -630,6 +626,7 @@ async fn rocket() -> _ {
     build()
         .configure(figment)
         .manage(collections)
+        .manage(config)
         .mount(
             "/",
             routes![
