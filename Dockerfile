@@ -23,6 +23,7 @@ COPY Cargo.toml Cargo.lock ./
 # Copy source so Cargo sees main.rs
 COPY src ./src
 COPY Rocket.toml .
+COPY site ./site
 
 
 # Fetch dependencies (this caches deps properly)

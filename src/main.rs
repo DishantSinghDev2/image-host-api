@@ -12,25 +12,26 @@ mod util;
 use background_optimization::{optimize_image_and_update, optimize_images_from_database};
 use base64::{engine::general_purpose, Engine as _};
 use dotenv::dotenv;
+use image::GenericImageView;
 use log::{error, info};
-use rocket::data::ToByteUnit;
+use rocket::data::{Limits, ToByteUnit};
 use rocket::form::Form;
 use rocket::http::{ContentType, Header, Status};
 use rocket::request::{self, FromRequest, Outcome, Request};
-use rocket::response::{status, status::Custom, Html, Redirect};
+use rocket::response::{content::Html, status, status::Custom, Redirect};
 use rocket::serde::{json::Json, Deserialize, Serialize};
-use rocket::{catcher, Data, State};
+use rocket::{catch, routes, get, post, launch, build, Data, State};
 use rocket_multipart_form_data::{
     mime, MultipartFormData, MultipartFormDataField, MultipartFormDataOptions,
 };
-use image::GenericImageView;
 use tokio::{join, task};
 use util::ImageId;
+
 
 lazy_static! {
     static ref HOST: String = std::env::var("HOST").unwrap_or("i.dishis.tech".to_string());
     // The secret key for authorizing uploads. Must be set in the environment.
-    static ref API_SECRET_KEY: String = std::env::var("API_SECRET_KEY")
+    static ref API_SECRET_key: String = std::env::var("API_SECRET_KEY")
         .expect("API_SECRET_KEY must be set in the environment");
 }
 
@@ -51,12 +52,12 @@ impl<'r> FromRequest<'r> for ApiKeyGuard {
 
     async fn from_request(req: &'r Request<'_>) -> request::Outcome<Self, Self::Error> {
         match req.headers().get_one("X-API-KEY") {
-            None => Outcome::Failure((Status::Unauthorized, ApiKeyError::Missing)),
+            None => Outcome::Error((Status::Unauthorized, ApiKeyError::Missing)),
             Some(key) => {
                 if key == *API_SECRET_KEY {
                     Outcome::Success(ApiKeyGuard)
                 } else {
-                    Outcome::Failure((Status::Forbidden, ApiKeyError::Invalid))
+                    Outcome::Error((Status::Forbidden, ApiKeyError::Invalid))
                 }
             }
         }
@@ -237,7 +238,7 @@ async fn process_and_respond(
         encoded_thumbnail_result.map_err(|e| create_error(Status::InternalServerError, &e))?;
     let image_id =
         image_id_result.map_err(|e| create_error(Status::InternalServerError, &e.to_string()))?;
-    
+
     let delete_token = util::generate_delete_token(16);
 
     let insert_result = db::insert_image(
@@ -328,7 +329,15 @@ async fn process_and_respond(
 #[response(status = 200)]
 struct HtmlResponder(&'static str, Header<'static>);
 
-#[post("/api/upload", data = "<data>", format = "json", rank = 1, limits = "32 megabytes")]
+#[get("/")]
+fn index() -> HtmlResponder {
+    HtmlResponder(
+        include_str!("../site/index.html"),
+        Header::new("Content-Type", "text/html; charset=utf-8"),
+    )
+}
+
+#[post("/api/upload", data = "<data>", format = "json", rank = 1)]
 async fn api_upload_json(
     _api_key: ApiKeyGuard, // This guard protects the route
     data: Json<ApiUploadRequest>,
@@ -350,7 +359,7 @@ async fn api_upload_json(
     ))
 }
 
-#[post("/api/upload", data = "<form>", format = "form", rank = 2, limits = "32 megabytes")]
+#[post("/api/upload", data = "<form>", format = "form", rank = 2)]
 async fn api_upload_form(
     _api_key: ApiKeyGuard, // This guard protects the route
     form: Form<UrlencodedUpload>,
@@ -359,7 +368,7 @@ async fn api_upload_form(
     process_text_upload(form.into_inner().image, &collections.images).await
 }
 
-#[post("/api/upload", data = "<data>", rank = 3, limits = "32 megabytes")]
+#[post("/api/upload", data = "<data>", rank = 3)]
 async fn api_upload_fallback(
     _api_key: ApiKeyGuard, // This guard protects the route
     content_type: &ContentType,
@@ -407,7 +416,7 @@ async fn api_upload_fallback(
         ));
     }
 
-    // --- CASE 2: Custom raw boundary parsing ---
+    // --- CASE 2: Use the raw body, respecting the 32MB limit set globally.
     let raw_body = data
         .open(32.megabytes())
         .into_bytes()
@@ -415,43 +424,10 @@ async fn api_upload_fallback(
         .map_err(|_| create_error(Status::BadRequest, "Failed to read request body"))?
         .into_inner();
 
-    let body_str = String::from_utf8_lossy(&raw_body);
-
-    if let Some(start) = body_str.find("------") {
-        let boundary_line = body_str.lines().next().unwrap_or("").trim().to_string();
-
-        let boundary = boundary_line.trim();
-        let parts: Vec<&str> = body_str.split(boundary).collect();
-
-        for part in parts {
-            if part.contains("Content-Disposition")
-                && part.contains("filename=")
-                && part.contains("Content-Type")
-            {
-                if let Some(idx) = part.find("\r\n\r\n") {
-                    let file_data = &part[idx + 4..];
-                    let file_bytes = file_data.as_bytes().to_vec();
-
-                    let ct = if let Some(ct_idx) = part.find("Content-Type:") {
-                        let line = part[ct_idx..].lines().next().unwrap_or("");
-                        line.replace("Content-Type:", "").trim().to_string()
-                    } else {
-                        infer::get(&file_bytes)
-                            .map(|k| k.mime_type().to_string())
-                            .unwrap_or_else(|| "application/octet-stream".to_string())
-                    };
-
-                    return process_and_respond(file_bytes, &ct, &collections.images).await;
-                }
-            }
-        }
-    }
-
-    // --- CASE 3: Raw binary ---
     if raw_body.is_empty() {
         return Err(create_error(Status::BadRequest, "No image data received."));
     }
-
+    
     let ct = infer::get(&raw_body)
         .map(|kind| kind.mime_type().to_string())
         .unwrap_or_else(|| "application/octet-stream".to_string());
@@ -602,7 +578,7 @@ async fn post_delete_image_route(
 
 // --- Error Catchers for Auth ---
 
-#[catcher(401)]
+#[catch(401)]
 fn unauthorized() -> Json<ApiErrorResponse> {
     Json(ApiErrorResponse {
         error: "Unauthorized. The X-API-KEY header is missing.".to_string(),
@@ -611,7 +587,7 @@ fn unauthorized() -> Json<ApiErrorResponse> {
     })
 }
 
-#[catcher(403)]
+#[catch(403)]
 fn forbidden() -> Json<ApiErrorResponse> {
     Json(ApiErrorResponse {
         error: "Forbidden. The provided API key is invalid.".to_string(),
@@ -627,6 +603,11 @@ fn forbidden() -> Json<ApiErrorResponse> {
 async fn rocket() -> _ {
     dotenv().ok();
     env_logger::init();
+
+    // Set a 32 megabyte limit for all incoming data.
+    let figment = rocket::Config::figment()
+        .merge(("limits", Limits::new().limit("bytes", 32.mebibytes().into())));
+
     let images_collection = db::connect().await.unwrap();
     println!("Connected to database");
 
@@ -639,7 +620,8 @@ async fn rocket() -> _ {
             .expect("Failed optimizing images");
     });
 
-    rocket::build()
+    build()
+        .configure(figment)
         .manage(collections)
         .mount(
             "/",
@@ -651,9 +633,9 @@ async fn rocket() -> _ {
                 view_image_route,
                 redirect_image_route,
                 view_thumbnail_route,
-                get_delete_confirmation_page, // New route for confirmation page
-                post_delete_image_route      // New route for actual deletion
+                get_delete_confirmation_page,
+                post_delete_image_route
             ],
         )
-        .register("/", catchers![unauthorized, forbidden])
+        .register("/", catch![unauthorized, forbidden])
 }

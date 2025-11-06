@@ -3,6 +3,7 @@
 
 use std::io::Cursor;
 
+use mongodb::bson::{doc, spec::BinarySubtype}; // Add this import
 use crate::encoding::{from_image, FromImageOptions};
 use crate::{db, util};
 use bson::Document;
@@ -51,7 +52,6 @@ pub async fn optimize_image_and_update(
             image.clone(),
             FromImageOptions {
                 optimize_png: true,
-                max_size: Some(1024),
                 ..FromImageOptions::default()
             },
         ),
@@ -72,28 +72,27 @@ pub async fn optimize_image_and_update(
     let (encoded_image, encoded_thumbnail) = (encoded_image_result?, encoded_thumbnail_result?);
 
     info!(
-        "inserting into database {}, new optimization level: {}",
+        "updating image {} in database, new optimization level: {}",
         image_id,
         optimization_level + 1
     );
-    db::insert_image(
-        images_collection,
-        &db::NewImage {
-            id: &image_id,
 
-            data: &encoded_image.data,
-            content_type: &encoded_image.content_type,
-
-            thumbnail_data: &encoded_thumbnail.data,
-            thumbnail_content_type: &encoded_thumbnail.content_type,
-
-            size: encoded_image.size,
-
-            optim_level: optimization_level + 1,
+    // CORRECTED: Use a direct `update_one` call instead of `db::insert_image`
+    images_collection.update_one(
+        doc! {"_id": image_id.to_string()},
+        doc! {
+            "$set": {
+                "data": bson::Binary { subtype: BinarySubtype::Generic, bytes: encoded_image.data.to_vec() },
+                "content_type": encoded_image.content_type.to_string(),
+                "width": encoded_image.size.0,
+                "height": encoded_image.size.1,
+                "thumbnail_data": bson::Binary { subtype: BinarySubtype::Generic, bytes: encoded_thumbnail.data.to_vec() },
+                "thumbnail_content_type": encoded_thumbnail.content_type.to_string(),
+                "optim_level": (optimization_level + 1) as i32,
+            }
         },
-    )
-    .await
-    .map_err(|_| "Inserting into database failed")?;
+        None
+    ).await.map_err(|e| format!("Updating database failed: {}", e))?;
 
     Ok(())
 }
