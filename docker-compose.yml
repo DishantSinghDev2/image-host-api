@@ -12,6 +12,7 @@ services:
       - HOST=i.dishis.tech
       - ROCKET_ADDRESS=0.0.0.0
       - ROCKET_PORT=8080
+      - API_SECRET_KEY=${API_SECRET_KEY}
     depends_on:
       - mongo
 
