@@ -164,11 +164,11 @@ fn mime_to_extension(mime_type: &str) -> &str {
 }
 
 
-// --- Image Processing Logic (CORRECTED) ---
+// --- Image Processing Logic ---
 async fn process_text_upload(
     mut text_value: String,
     images_collection: &mongodb::Collection<mongodb::bson::Document>,
-    config: &State<Config>, // <-- CORRECTED: Added config argument
+    config: &State<Config>,
 ) -> Result<Json<ApiResponse>, Custom<Json<ApiErrorResponse>>> {
     text_value = text_value.trim().to_string();
 
@@ -201,7 +201,7 @@ async fn process_and_respond(
     image_bytes: Vec<u8>,
     content_type_string: &str,
     images_collection: &mongodb::Collection<mongodb::bson::Document>,
-    config: &State<Config>, // <-- CORRECTED: Added config argument
+    config: &State<Config>,
 ) -> Result<Json<ApiResponse>, Custom<Json<ApiErrorResponse>>> {
     if image_bytes.is_empty() {
         return Err(create_error(
@@ -401,8 +401,6 @@ async fn api_upload_unified(
                 return Err(create_error(Status::BadRequest, "Missing 'image' field in multipart form."));
             }
             Err(_) => {
-                // This is the error you were getting. We can now give a better message or try another method.
-                // For now, we'll return the helpful error.
                 let error_message = "Failed to parse multipart/form-data. This often happens if the 'Content-Type' header is missing a boundary or is malformed.";
                 return Err(create_error(Status::BadRequest, error_message));
             }
@@ -417,12 +415,10 @@ async fn api_upload_unified(
         if !form_str.is_complete() {
             return Err(create_error(Status::PayloadTooLarge, "Form data is too large."));
         }
-
-        // CORRECTED: Parse directly into your struct `UrlencodedUpload`, not `Form<UrlencodedUpload>`
+        
         let form_result: Result<UrlencodedUpload, _> = Form::parse(form_str.into_inner().as_str());
         
         return match form_result {
-            // CORRECTED: `form_content` is now `UrlencodedUpload`, so no .into_inner() is needed.
             Ok(form_content) => process_text_upload(form_content.image, &collections.images, config).await,
             Err(_) => Err(create_error(Status::BadRequest, "Failed to parse URL-encoded form."))
         }
@@ -634,7 +630,7 @@ async fn rocket() -> _ {
             "/",
             routes![
                 index,
-                api_upload_unified, // The ONLY upload route needed now!
+                api_upload_unified,
                 view_image_route,
                 redirect_image_route,
                 view_thumbnail_route,
