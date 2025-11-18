@@ -578,6 +578,12 @@ async fn post_delete_image_route(
     }
 }
 
+#[get("/health")]
+fn health() -> &'static str {
+    "ok"
+}
+
+
 #[catch(401)]
 fn unauthorized() -> Json<ApiErrorResponse> {
     Json(ApiErrorResponse {
@@ -639,7 +645,8 @@ async fn rocket() -> _ {
                 redirect_image_route,
                 view_thumbnail_route,
                 get_delete_confirmation_page,
-                post_delete_image_route
+                post_delete_image_route,
+                health
             ],
         )
         .register("/", catchers![unauthorized, forbidden])

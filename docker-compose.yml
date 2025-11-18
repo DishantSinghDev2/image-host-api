@@ -4,8 +4,9 @@ services:
   app:
     build: .
     container_name: image-host-api-app-1
+    restart: always        # yep, don't die silently
     ports:
-      - "8000:8080" # optional, only needed if you want local access
+      - "8000:8080"
     environment:
       - MONGODB_URI=mongodb://mongo:27017
       - MONGODB_DB_NAME=image_host
@@ -15,6 +16,11 @@ services:
       - API_SECRET_KEY=${API_SECRET_KEY}
     depends_on:
       - mongo
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
 
   mongo:
     image: mongo:latest
@@ -33,8 +39,7 @@ services:
     volumes:
       - ./cloudflared:/etc/cloudflared
     depends_on:
-      - app
-    # optional: link to app container by network name
+      - app   # waits for app to be at least created
     networks:
       - default
 
